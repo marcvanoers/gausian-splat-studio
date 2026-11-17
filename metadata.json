@@ -1,0 +1,6 @@
+{
+  "name": "Postshot - 3D Gaussian Splatting Studio",
+  "description": "Professional 3D Gaussian Splatting studio to create, optimize, edit, and export radiance fields from video or images into PLY and SPLAT formats.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

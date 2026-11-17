@@ -189,7 +189,7 @@ export default function App() {
           Number((b.max[1] + padY).toFixed(2)),
           Number((b.max[2] + padZ).toFixed(2)),
         ],
-        floorClipY: Number(b.min[1].toFixed(2)),
+        floorClipY: Number((b.min[1] - padY).toFixed(2)),
       });
     }
 
@@ -281,7 +281,7 @@ export default function App() {
         Number((b.max[1] + padY).toFixed(2)),
         Number((b.max[2] + padZ).toFixed(2)),
       ],
-      floorClipY: Number(b.min[1].toFixed(2)),
+      floorClipY: Number((b.min[1] - padY).toFixed(2)),
     });
   };
 

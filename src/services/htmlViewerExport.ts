@@ -46,6 +46,7 @@ export async function blobToBase64Parts(blob: Blob): Promise<string[]> {
 // Above this the embedded base64 text gets too large for browsers to read back as a single string.
 const MAX_EMBEDDED_MODEL_BYTES = 300 * 1024 * 1024;
 const PAYLOAD_PLACEHOLDER = '__SPLAT_BASE64_PAYLOAD__';
+const PAYLOAD_TAG_OPEN = '<script id="splat-data" type="application/octet-stream">';
 
 /**
  * Generates the complete standalone HTML document.
@@ -474,7 +475,7 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
   </div>
 
   <!-- Embedded 3DGS Binary Splat Data (Base64) -->
-  <script id="splat-data" type="application/octet-stream">${PAYLOAD_PLACEHOLDER}</script>
+  ${PAYLOAD_TAG_OPEN}${PAYLOAD_PLACEHOLDER}</script>
 
   <!-- Interactive Viewer Script -->
   <script type="module">
@@ -784,7 +785,10 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
 </body>
 </html>`;
 
-  const [before, after] = html.split(PAYLOAD_PLACEHOLDER);
+  // Locate the payload via its script tag; user text is HTML-escaped so it can't contain the tag.
+  const cut = html.indexOf(PAYLOAD_TAG_OPEN + PAYLOAD_PLACEHOLDER) + PAYLOAD_TAG_OPEN.length;
+  const before = html.slice(0, cut);
+  const after = html.slice(cut + PAYLOAD_PLACEHOLDER.length);
   return new Blob([before, ...base64Parts, after], { type: 'text/html;charset=utf-8' });
 }
 

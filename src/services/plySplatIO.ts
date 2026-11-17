@@ -457,6 +457,18 @@ export async function parseGaussianFile(file: File): Promise<GaussianCloud> {
   };
 }
 
+/** Copies the per-splat SH coefficients of the given source indices (undefined if the cloud has none). */
+export function selectHarmonics(cloud: GaussianCloud, indices: ArrayLike<number>): Float32Array | undefined {
+  if (!cloud.harmonics || cloud.count === 0) return undefined;
+  const stride = Math.floor(cloud.harmonics.length / cloud.count);
+  const out = new Float32Array(indices.length * stride);
+  for (let i = 0; i < indices.length; i++) {
+    const src = indices[i] * stride;
+    out.set(cloud.harmonics.subarray(src, src + stride), i * stride);
+  }
+  return out;
+}
+
 /**
  * Prunes giant floaters / background bubbles whose scale exceeds a cutoff threshold.
  */
@@ -513,6 +525,7 @@ export function pruneGiantSplats(cloud: GaussianCloud, maxScaleThreshold: number
     rotations,
     colors,
     opacities,
+    harmonics: selectHarmonics(cloud, kept),
     bounds: cloud.bounds,
   };
 }

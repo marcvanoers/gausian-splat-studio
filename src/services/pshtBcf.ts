@@ -118,6 +118,12 @@ export async function parseBcfSplats(file: File): Promise<GaussianCloud> {
     positions[i3] = px[i];
     positions[i3 + 1] = py[i];
     positions[i3 + 2] = pz[i];
+    if (px[i] < minX) minX = px[i];
+    if (px[i] > maxX) maxX = px[i];
+    if (py[i] < minY) minY = py[i];
+    if (py[i] > maxY) maxY = py[i];
+    if (pz[i] < minZ) minZ = pz[i];
+    if (pz[i] > maxZ) maxZ = pz[i];
     scales[i3] = Math.exp(sx[i]);
     scales[i3 + 1] = Math.exp(sy[i]);
     scales[i3 + 2] = Math.exp(sz[i]);
@@ -133,7 +139,8 @@ export async function parseBcfSplats(file: File): Promise<GaussianCloud> {
     opacities[i] = 1 / (1 + Math.exp(-opacityLogit[i]));
   }
 
-  // Bounds from the 1st-99th percentile so far-away background splats don't dominate framing.
+  // min/max are the true extents (crop box); center/radius use the 1st-99th percentile
+  // so far-away background splats don't dominate camera framing.
   const sample = Math.min(count, 200000);
   const step = count / sample;
   const xs = new Float32Array(sample), ys = new Float32Array(sample), zs = new Float32Array(sample);
@@ -143,7 +150,8 @@ export async function parseBcfSplats(file: File): Promise<GaussianCloud> {
   }
   xs.sort(); ys.sort(); zs.sort();
   const lo = Math.floor(sample * 0.01), hi = Math.max(lo, Math.ceil(sample * 0.99) - 1);
-  minX = xs[lo]; maxX = xs[hi]; minY = ys[lo]; maxY = ys[hi]; minZ = zs[lo]; maxZ = zs[hi];
+  const robustMin = [xs[lo], ys[lo], zs[lo]];
+  const robustMax = [xs[hi], ys[hi], zs[hi]];
 
   const cloud: GaussianCloud = {
     count,
@@ -155,8 +163,8 @@ export async function parseBcfSplats(file: File): Promise<GaussianCloud> {
     bounds: {
       min: [minX, minY, minZ],
       max: [maxX, maxY, maxZ],
-      center: [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2],
-      radius: Math.max(maxX - minX, maxY - minY, maxZ - minZ) / 2,
+      center: [0, 1, 2].map((k) => (robustMin[k] + robustMax[k]) / 2) as [number, number, number],
+      radius: Math.max(...[0, 1, 2].map((k) => robustMax[k] - robustMin[k])) / 2,
     },
   };
 

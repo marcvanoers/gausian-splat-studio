@@ -165,6 +165,8 @@ export default function App() {
       maxSplatSize: 2.0,
       displayBudget: 2000000,
       shDegree: 1,
+      // Postshot projects are stored Y-down (COLMAP convention).
+      invertY: metadata.sourceType === 'psht' ? true : prev.invertY,
     }));
 
     // Auto-fit 3D crop box to loaded model bounds if present
@@ -189,7 +191,7 @@ export default function App() {
           Number((b.max[1] + padY).toFixed(2)),
           Number((b.max[2] + padZ).toFixed(2)),
         ],
-        floorClipY: Number(b.min[1].toFixed(2)),
+        floorClipY: Number((b.min[1] - padY).toFixed(2)),
       });
     }
 
@@ -281,7 +283,7 @@ export default function App() {
         Number((b.max[1] + padY).toFixed(2)),
         Number((b.max[2] + padZ).toFixed(2)),
       ],
-      floorClipY: Number(b.min[1].toFixed(2)),
+      floorClipY: Number((b.min[1] - padY).toFixed(2)),
     });
   };
 

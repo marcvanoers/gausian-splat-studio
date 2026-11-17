@@ -180,7 +180,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         : `${exportSplatCount.toLocaleString()} splats (${qualityPercent}%, ${htmlFormat.toUpperCase()})`;
       setExportMessage(`Packaging ${modeLabel} into standalone HTML...`);
 
-      const htmlContent = await generateStandaloneHtml({
+      const blob = await generateStandaloneHtml({
         cloud,
         project: currentProject,
         cropBox,
@@ -193,7 +193,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         useOriginalSource: isLosslessOriginalActive,
       });
 
-      const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
       triggerDownload(blob, `${currentProject.id}_${qualityPercent}pct_3dgs_viewer.html`);
     } catch (err: any) {
       console.error('Failed to export HTML viewer:', err);

@@ -6,6 +6,7 @@
  */
 
 import { GaussianCloud, TrainingState } from '../types/gaussian';
+import { selectHarmonics } from './plySplatIO';
 
 export class TrainingEngine {
   private fullCloud: GaussianCloud;
@@ -161,6 +162,9 @@ export class TrainingEngine {
       rotations,
       colors,
       opacities,
+      harmonics: source.harmonics
+        ? source.harmonics.slice(0, safeCount * Math.floor(source.harmonics.length / source.count))
+        : undefined,
       bounds: source.bounds,
     };
   }
@@ -220,6 +224,8 @@ export class TrainingEngine {
       rotations,
       colors,
       opacities: newOpacities,
+      harmonics: selectHarmonics(this.currentCloud, keptIndices),
+      bounds: this.currentCloud.bounds,
     };
     this.state.activeGaussians = newCount;
     this.onStateChange(this.state, this.currentCloud);

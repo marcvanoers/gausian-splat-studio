@@ -9,8 +9,28 @@ import { GaussianCloud, CameraPose, CropBox, ProjectMetadata } from '../types/ga
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
 import JSZip from 'jszip';
 import initSqlJs from 'sql.js';
+import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 
 const SH_C0 = 0.28209479177387814;
+
+export class PshtUnsupportedError extends Error {
+  constructor(fileName: string, containerDescription: string) {
+    super(
+      `"${fileName}" could not be read: no Gaussian splat data was found (${containerDescription}). ` +
+        'The .psht project format is proprietary and undocumented. ' +
+        'In Postshot, export the trained splat as .ply (or run "postshot-cli export -f <file>.psht --export-splat <file>.ply") and import that .ply here.'
+    );
+    this.name = 'PshtUnsupportedError';
+  }
+}
+
+function describeContainer(uint8: Uint8Array): string {
+  const magic = Array.from(uint8.subarray(0, 8))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join(' ');
+  const sizeMb = (uint8.byteLength / (1024 * 1024)).toFixed(1);
+  return `${sizeMb} MB, header bytes: ${magic}`;
+}
 
 /**
  * Filter Gaussians by crop box if enabled and optionally sample by qualityRatio
@@ -386,7 +406,7 @@ export async function parseGaussianFile(file: File): Promise<GaussianCloud> {
     colors[i * 3 + 1] = Math.max(0, Math.min(1, (s[11] || 0) / 255));
     colors[i * 3 + 2] = Math.max(0, Math.min(1, (s[12] || 0) / 255));
 
-    opacities[i] = Math.max(0, Math.min(1, (s[13] || 255) / 255));
+    opacities[i] = Math.max(0, Math.min(1, (s[13] ?? 255) / 255));
   }
 
   const spanX = Math.max(0.1, maxX - minX);
@@ -597,24 +617,6 @@ export function parseColmapPoints3DText(text: string): GaussianCloud | null {
 }
 
 /**
- * Helper to compute an orientation quaternion from a surface normal vector (nx, ny, nz)
- * Aligning default Z-axis (0, 0, 1) to the surface normal.
- */
-function quatFromNormal(nx: number, ny: number, nz: number): [number, number, number, number] {
-  const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-  nx /= len; ny /= len; nz /= len;
-  if (nz < -0.999) {
-    return [0, 1, 0, 0];
-  }
-  const w = 1 + nz;
-  const qx = -ny;
-  const qy = nx;
-  const qz = 0;
-  const qLen = Math.sqrt(w * w + qx * qx + qy * qy + qz * qz) || 1;
-  return [w / qLen, qx / qLen, qy / qLen, qz / qLen];
-}
-
-/**
  * Computes world camera center C = -R^T * t from COLMAP / Postshot quaternion & translation
  */
 export function computeCameraCenterFromPose(
@@ -810,480 +812,6 @@ function isSqliteDatabase(uint8: Uint8Array): boolean {
   return true;
 }
 
-/**
- * Builds a calibrated 3D Gaussian radiance cloud from camera poses when project contains external media references.
- * Reconstructs realistic structured surface geometry (e.g. Land Rover 4x4 Defender) with surface-aligned
- * thin Gaussian discs and authentic materials rather than an amorphous volumetric fog ball.
- */
-/**
- * Builds realistic motor yacht / boat surface geometry for marine and boat captures
- */
-function buildBoatCloudFromTrajectory(poses: CameraPose[], baseName: string): GaussianCloud {
-  let avgX = 0, avgY = 0, avgZ = 0;
-  const n = Math.max(1, poses.length);
-  poses.forEach((p) => {
-    avgX += p.position[0];
-    avgY += p.position[1];
-    avgZ += p.position[2];
-  });
-  avgX /= n;
-  avgY /= n;
-  avgZ /= n;
-
-  let maxDist = 2.5;
-  poses.forEach((p) => {
-    const dx = p.position[0] - avgX;
-    const dy = p.position[1] - avgY;
-    const dz = p.position[2] - avgZ;
-    const dist = Math.hypot(dx, dy, dz);
-    if (dist > maxDist) maxDist = dist;
-  });
-
-  const targetCount = 38000;
-  const positions = new Float32Array(targetCount * 3);
-  const scales = new Float32Array(targetCount * 3);
-  const rotations = new Float32Array(targetCount * 4);
-  const colors = new Float32Array(targetCount * 3);
-  const opacities = new Float32Array(targetCount);
-
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-  const setPoint = (
-    i: number,
-    x: number,
-    y: number,
-    z: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    r: number,
-    g: number,
-    b: number,
-    sTang: number = 0.016,
-    sNorm: number = 0.003,
-    op: number = 0.96
-  ) => {
-    positions[i * 3] = x;
-    positions[i * 3 + 1] = y;
-    positions[i * 3 + 2] = z;
-
-    if (x < minX) minX = x; if (x > maxX) maxX = x;
-    if (y < minY) minY = y; if (y > maxY) maxY = y;
-    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-
-    scales[i * 3] = sTang;
-    scales[i * 3 + 1] = sTang;
-    scales[i * 3 + 2] = sNorm;
-
-    const q = quatFromNormal(nx, ny, nz);
-    rotations[i * 4] = q[0];
-    rotations[i * 4 + 1] = q[1];
-    rotations[i * 4 + 2] = q[2];
-    rotations[i * 4 + 3] = q[3];
-
-    colors[i * 3] = Math.max(0, Math.min(1, r));
-    colors[i * 3 + 1] = Math.max(0, Math.min(1, g));
-    colors[i * 3 + 2] = Math.max(0, Math.min(1, b));
-
-    opacities[i] = op;
-  };
-
-  let ptIdx = 0;
-  const boatLen = 3.6;
-  const boatWid = 1.35;
-  const keelY = 0.08;
-  const deckY = 0.65;
-
-  // 1. Sleek V-Hull (Deep Navy Blue Gelcoat)
-  const hullCount = 14000;
-  for (let i = 0; i < hullCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const z = avgZ + (u * 2 - 1) * (boatLen * 0.5);
-    const taper = u > 0.5 ? Math.cos((u - 0.5) * Math.PI) : 1.0;
-    const halfW = (boatWid * 0.5) * taper;
-    const side = Math.random() < 0.5 ? 1 : -1;
-    const v = Math.random();
-    const x = avgX + side * halfW * Math.pow(v, 0.65);
-    const y = keelY + v * (deckY - keelY) + (u > 0.8 ? (u - 0.8) * 0.35 : 0);
-    const isWaterline = Math.abs(y - 0.22) < 0.035;
-    const r = isWaterline ? 0.85 : 0.06;
-    const g = isWaterline ? 0.25 : 0.12;
-    const b = isWaterline ? 0.20 : 0.24;
-    setPoint(ptIdx, x, y, z, side, 0.4, (u - 0.5) * 0.4, r, g, b, 0.016, 0.003, 0.98);
-  }
-
-  // 2. Teak Wood Deck & Cockpit
-  const deckCount = 8000;
-  for (let i = 0; i < deckCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const z = avgZ + (u * 2 - 1) * (boatLen * 0.48);
-    const taper = u > 0.5 ? Math.cos((u - 0.5) * Math.PI) : 1.0;
-    const halfW = (boatWid * 0.46) * taper;
-    const x = avgX + (Math.random() * 2 - 1) * halfW;
-    const y = deckY + (u > 0.8 ? (u - 0.8) * 0.25 : 0);
-    const plank = Math.sin(x * 120) > 0;
-    const r = plank ? 0.76 : 0.68;
-    const g = plank ? 0.55 : 0.48;
-    const b = plank ? 0.36 : 0.30;
-    setPoint(ptIdx, x, y, z, 0, 1, 0, r, g, b, 0.014, 0.002, 0.96);
-  }
-
-  // 3. Cabin, Windshield & Hardtop
-  const cabinCount = 6500;
-  for (let i = 0; i < cabinCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const z = avgZ + (u - 0.5) * 1.5 + 0.15;
-    const x = avgX + (Math.random() - 0.5) * (boatWid * 0.65);
-    const isRoof = Math.random() < 0.35;
-    if (isRoof) {
-      const y = deckY + 0.62;
-      setPoint(ptIdx, x, y, z, 0, 1, 0, 0.92, 0.94, 0.95, 0.015, 0.003, 0.98);
-    } else {
-      const y = deckY + 0.05 + Math.random() * 0.55;
-      setPoint(ptIdx, x, y, z, 0.5, 0.3, 0.8, 0.25, 0.48, 0.65, 0.016, 0.002, 0.90);
-    }
-  }
-
-  // 4. Stern Transom & Outboard Motors
-  const sternCount = 3500;
-  for (let i = 0; i < sternCount && ptIdx < targetCount; i++, ptIdx++) {
-    const z = avgZ - (boatLen * 0.5);
-    const x = avgX + (Math.random() - 0.5) * (boatWid * 0.85);
-    const y = keelY + Math.random() * (deckY - keelY);
-    setPoint(ptIdx, x, y, z, 0, 0, -1, 0.90, 0.92, 0.95, 0.015, 0.003, 0.98);
-  }
-
-  // 5. Water Surface Reflection Ring
-  while (ptIdx < targetCount) {
-    const rad = 1.2 + Math.random() * (maxDist * 0.7);
-    const theta = Math.random() * Math.PI * 2;
-    const x = avgX + Math.cos(theta) * rad;
-    const z = avgZ + Math.sin(theta) * rad * 1.3;
-    const y = keelY + (Math.random() - 0.5) * 0.02;
-    setPoint(ptIdx, x, y, z, 0, 1, 0, 0.08, 0.35, 0.52, 0.025, 0.002, 0.85);
-    ptIdx++;
-  }
-
-  const spanX = Math.max(0.1, maxX - minX);
-  const spanY = Math.max(0.1, maxY - minY);
-  const spanZ = Math.max(0.1, maxZ - minZ);
-  const radius = Math.max(spanX, spanY, spanZ) * 0.5;
-
-  return {
-    count: targetCount,
-    positions,
-    scales,
-    rotations,
-    colors,
-    opacities,
-    bounds: {
-      min: [minX, minY, minZ],
-      max: [maxX, maxY, maxZ],
-      center: [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2],
-      radius,
-    },
-  };
-}
-
-function buildCloudFromCameraTrajectory(poses: CameraPose[], baseName: string): GaussianCloud {
-  const lowerName = baseName.toLowerCase();
-  const isBoat = lowerName.includes('boat') || lowerName.includes('ship') || lowerName.includes('yacht') || lowerName.includes('vessel') || lowerName.includes('marine') || lowerName.includes('water');
-  if (isBoat) {
-    return buildBoatCloudFromTrajectory(poses, baseName);
-  }
-
-  // Compute centroid of cameras
-  let avgX = 0, avgY = 0, avgZ = 0;
-  const n = Math.max(1, poses.length);
-  poses.forEach((p) => {
-    avgX += p.position[0];
-    avgY += p.position[1];
-    avgZ += p.position[2];
-  });
-  avgX /= n;
-  avgY /= n;
-  avgZ /= n;
-
-  // Compute radius of camera sphere
-  let maxDist = 2.5;
-  poses.forEach((p) => {
-    const dx = p.position[0] - avgX;
-    const dy = p.position[1] - avgY;
-    const dz = p.position[2] - avgZ;
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dist > maxDist) maxDist = dist;
-  });
-
-  const targetCount = 35000;
-  const positions = new Float32Array(targetCount * 3);
-  const scales = new Float32Array(targetCount * 3);
-  const rotations = new Float32Array(targetCount * 4);
-  const colors = new Float32Array(targetCount * 3);
-  const opacities = new Float32Array(targetCount);
-
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-  // Vehicle Dimensions (Land Rover Defender style proportions)
-  const carLen = 3.4; // Z: -1.7 to +1.7
-  const carWid = 1.8; // X: -0.9 to +0.9
-  const carHgt = 1.45; // Y: 0.25 to 1.70
-  const groundY = 0.0;
-
-  // Predefined components distribution
-  // 1. Hood: 4,000 points
-  // 2. Roof & Rack: 5,000 points
-  // 3. Windshield & Windows: 3,500 points
-  // 4. Doors & Body Sides: 7,500 points
-  // 5. Grille, Fascia & Headlights: 4,000 points
-  // 6. Rear & Spare Wheel: 3,500 points
-  // 7. 4 Wheels & Tires: 4,000 points
-  // 8. Ground Plane with Shadow: 3,500 points
-
-  const setPoint = (
-    i: number,
-    x: number,
-    y: number,
-    z: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    r: number,
-    g: number,
-    b: number,
-    sTang: number = 0.018,
-    sNorm: number = 0.003,
-    op: number = 0.95
-  ) => {
-    positions[i * 3] = x;
-    positions[i * 3 + 1] = y;
-    positions[i * 3 + 2] = z;
-
-    if (x < minX) minX = x; if (x > maxX) maxX = x;
-    if (y < minY) minY = y; if (y > maxY) maxY = y;
-    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-
-    scales[i * 3] = sTang;
-    scales[i * 3 + 1] = sTang;
-    scales[i * 3 + 2] = sNorm;
-
-    const q = quatFromNormal(nx, ny, nz);
-    rotations[i * 4] = q[0];
-    rotations[i * 4 + 1] = q[1];
-    rotations[i * 4 + 2] = q[2];
-    rotations[i * 4 + 3] = q[3];
-
-    colors[i * 3] = Math.max(0, Math.min(1, r));
-    colors[i * 3 + 1] = Math.max(0, Math.min(1, g));
-    colors[i * 3 + 2] = Math.max(0, Math.min(1, b));
-
-    opacities[i] = op;
-  };
-
-  let ptIdx = 0;
-
-  // Base paint color (British Racing Green / Metallic Slate)
-  const bodyR = 0.16, bodyG = 0.28, bodyB = 0.23;
-
-  // 1. Hood / Bonnet (Y ≈ 0.98, X: -0.85..0.85, Z: 0.55..1.65)
-  const hoodCount = 4000;
-  for (let i = 0; i < hoodCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const v = Math.random();
-    const x = avgX + (u - 0.5) * (carWid * 0.92);
-    const z = avgZ + 0.55 + v * 1.1;
-    const curve = Math.cos((u - 0.5) * Math.PI) * 0.04;
-    const y = 0.96 + curve;
-    const nx = (u - 0.5) * 0.3;
-    const ny = 0.95;
-    const nz = 0.1;
-    const noise = (Math.random() - 0.5) * 0.03;
-    setPoint(ptIdx, x, y, z, nx, ny, nz, bodyR + noise, bodyG + noise * 1.2, bodyB + noise);
-  }
-
-  // 2. Roof & Roof Rack (Y ≈ 1.62, X: -0.82..0.82, Z: -1.45..0.28)
-  const roofCount = 4500;
-  for (let i = 0; i < roofCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const v = Math.random();
-    const x = avgX + (u - 0.5) * (carWid * 0.88);
-    const z = avgZ - 1.45 + v * 1.73;
-    const isRack = Math.abs(x - avgX) > (carWid * 0.4) || (i % 6 === 0);
-    const y = isRack ? 1.68 : 1.62;
-    const r = isRack ? 0.08 : bodyR;
-    const g = isRack ? 0.08 : bodyG;
-    const b = isRack ? 0.09 : bodyB;
-    setPoint(ptIdx, x, y, z, 0, 1, 0, r, g, b);
-  }
-
-  // 3. Windshield & Rear/Side Windows (Glass)
-  const glassCount = 3800;
-  for (let i = 0; i < glassCount && ptIdx < targetCount; i++, ptIdx++) {
-    const sub = Math.random();
-    if (sub < 0.45) {
-      // Windshield: sloping from (0.98, 0.55) to (1.62, 0.28)
-      const u = Math.random();
-      const t = Math.random();
-      const x = avgX + (u - 0.5) * (carWid * 0.84);
-      const y = 0.98 + t * (1.62 - 0.98);
-      const z = avgZ + 0.55 - t * (0.55 - 0.28);
-      setPoint(ptIdx, x, y, z, 0, 0.72, 0.69, 0.08, 0.12, 0.16, 0.016, 0.003, 0.92);
-    } else if (sub < 0.7) {
-      // Rear Window
-      const u = Math.random();
-      const v = Math.random();
-      const x = avgX + (u - 0.5) * (carWid * 0.78);
-      const y = 1.1 + v * 0.48;
-      const z = avgZ - 1.68;
-      setPoint(ptIdx, x, y, z, 0, 0, -1, 0.07, 0.1, 0.14, 0.016, 0.003, 0.92);
-    } else {
-      // Side windows
-      const side = Math.random() < 0.5 ? 1 : -1;
-      const x = avgX + side * (carWid * 0.44);
-      const v = Math.random();
-      const t = Math.random();
-      const z = avgZ - 1.4 + v * 1.6;
-      const y = 1.05 + t * 0.5;
-      setPoint(ptIdx, x, y, z, side, 0, 0, 0.07, 0.1, 0.14, 0.016, 0.003, 0.92);
-    }
-  }
-
-  // 4. Doors & Side Body Panels (X ≈ ±0.88, Z: -1.65..0.6, Y: 0.45..1.05)
-  const sidesCount = 7000;
-  for (let i = 0; i < sidesCount && ptIdx < targetCount; i++, ptIdx++) {
-    const side = Math.random() < 0.5 ? 1 : -1;
-    const u = Math.random();
-    const v = Math.random();
-    const x = avgX + side * (carWid * 0.48 + (Math.random() - 0.5) * 0.02);
-    const z = avgZ - 1.65 + u * 2.25;
-    const y = 0.45 + v * 0.6;
-    const noise = (Math.random() - 0.5) * 0.025;
-    setPoint(ptIdx, x, y, z, side, 0, 0, bodyR + noise, bodyG + noise * 1.2, bodyB + noise);
-  }
-
-  // 5. Front Grille, Headlights & Bumper (Z ≈ 1.68)
-  const frontCount = 4200;
-  for (let i = 0; i < frontCount && ptIdx < targetCount; i++, ptIdx++) {
-    const u = Math.random();
-    const v = Math.random();
-    const x = avgX + (u - 0.5) * (carWid * 0.92);
-    const y = 0.28 + v * 0.68;
-    const z = avgZ + 1.68 + (y < 0.45 ? 0.05 : 0);
-
-    // Check for round headlights at X: ±0.58, Y: 0.74
-    const dx1 = Math.abs(x - (avgX + 0.58));
-    const dx2 = Math.abs(x - (avgX - 0.58));
-    const dy = Math.abs(y - 0.74);
-    const isHeadlight = (Math.hypot(dx1, dy) < 0.14) || (Math.hypot(dx2, dy) < 0.14);
-
-    if (isHeadlight) {
-      setPoint(ptIdx, x, y, z, 0, 0, 1, 0.95, 0.92, 0.85, 0.015, 0.003, 1.0);
-    } else if (y < 0.45) {
-      // Rugged bumper
-      setPoint(ptIdx, x, y, z, 0, 0, 1, 0.08, 0.08, 0.09, 0.018, 0.003, 0.98);
-    } else {
-      // Grille horizontal slats (silver and dark accents)
-      const slat = Math.sin(y * 45) > 0.1;
-      const r = slat ? 0.65 : 0.12;
-      const g = slat ? 0.65 : 0.12;
-      const b = slat ? 0.68 : 0.14;
-      setPoint(ptIdx, x, y, z, 0, 0, 1, r, g, b, 0.016, 0.003, 0.95);
-    }
-  }
-
-  // 6. Rear Door & Mounted Spare Wheel (Z ≈ -1.68)
-  const rearCount = 3800;
-  for (let i = 0; i < rearCount && ptIdx < targetCount; i++, ptIdx++) {
-    const sub = Math.random();
-    if (sub < 0.45) {
-      // Spare wheel mounted on rear door
-      const theta = Math.random() * Math.PI * 2;
-      const rad = 0.12 + Math.random() * 0.26;
-      const x = avgX + Math.cos(theta) * rad;
-      const y = 0.95 + Math.sin(theta) * rad;
-      const z = avgZ - 1.78;
-      const isRim = rad < 0.20;
-      const r = isRim ? 0.65 : 0.12;
-      const g = isRim ? 0.65 : 0.12;
-      const b = isRim ? 0.68 : 0.13;
-      setPoint(ptIdx, x, y, z, 0, 0, -1, r, g, b, 0.015, 0.003, 0.95);
-    } else {
-      // Rear door panels & tail lights
-      const u = Math.random();
-      const v = Math.random();
-      const x = avgX + (u - 0.5) * (carWid * 0.88);
-      const y = 0.35 + v * 1.15;
-      const z = avgZ - 1.68;
-      const isTailLight = Math.abs(Math.abs(x - avgX) - (carWid * 0.38)) < 0.08 && y > 0.65 && y < 1.05;
-      if (isTailLight) {
-        setPoint(ptIdx, x, y, z, 0, 0, -1, 0.9, 0.15, 0.1, 0.015, 0.003, 1.0);
-      } else {
-        setPoint(ptIdx, x, y, z, 0, 0, -1, bodyR, bodyG, bodyB, 0.018, 0.003, 0.95);
-      }
-    }
-  }
-
-  // 7. 4 Wheels & Tires (FL, FR, RL, RR)
-  const wheelCenters = [
-    { x: avgX + carWid * 0.52, z: avgZ + 1.05 },
-    { x: avgX - carWid * 0.52, z: avgZ + 1.05 },
-    { x: avgX + carWid * 0.52, z: avgZ - 1.05 },
-    { x: avgX - carWid * 0.52, z: avgZ - 1.05 },
-  ];
-  const perWheel = Math.floor(4000 / 4);
-  for (const wc of wheelCenters) {
-    const side = wc.x > avgX ? 1 : -1;
-    for (let i = 0; i < perWheel && ptIdx < targetCount; i++, ptIdx++) {
-      const theta = Math.random() * Math.PI * 2;
-      const rad = 0.08 + Math.random() * 0.30;
-      const depth = (Math.random() - 0.5) * 0.16;
-      const x = wc.x + depth;
-      const y = 0.38 + Math.sin(theta) * rad;
-      const z = wc.z + Math.cos(theta) * rad;
-      const isAlloyRim = rad < 0.20;
-      const r = isAlloyRim ? 0.68 : 0.11;
-      const g = isAlloyRim ? 0.68 : 0.11;
-      const b = isAlloyRim ? 0.72 : 0.12;
-      setPoint(ptIdx, x, y, z, side, 0, 0, r, g, b, 0.016, 0.003, 0.96);
-    }
-  }
-
-  // 8. Ground Surface with Asphalt & Soft Contact Shadow
-  while (ptIdx < targetCount) {
-    const u = (Math.random() - 0.5) * 4.8;
-    const v = (Math.random() - 0.5) * 5.2;
-    const x = avgX + u;
-    const z = avgZ + v;
-    const y = groundY;
-    // Ambient occlusion contact shadow under car
-    const inShadow = Math.abs(u) < (carWid * 0.55) && Math.abs(v) < (carLen * 0.55);
-    const shade = inShadow ? 0.07 : 0.18 + Math.random() * 0.05;
-    setPoint(ptIdx, x, y, z, 0, 1, 0, shade, shade, shade * 1.05, 0.024, 0.003, 0.9);
-    ptIdx++;
-  }
-
-  const spanX = Math.max(0.1, maxX - minX);
-  const spanY = Math.max(0.1, maxY - minY);
-  const spanZ = Math.max(0.1, maxZ - minZ);
-  const radius = Math.max(spanX, spanY, spanZ) * 0.5;
-
-  return {
-    count: targetCount,
-    positions,
-    scales,
-    rotations,
-    colors,
-    opacities,
-    bounds: {
-      min: [minX, minY, minZ],
-      max: [maxX, maxY, maxZ],
-      center: [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2],
-      radius,
-    },
-  };
-}
-
 export interface PshtParseResult {
   cloud: GaussianCloud;
   poses: CameraPose[];
@@ -1306,7 +834,7 @@ export async function parsePshtSqlite(
   try {
     const init = (initSqlJs as any).default || initSqlJs;
     const SQL = await init({
-      locateFile: (file: string) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0/${file}`,
+      locateFile: () => sqlWasmUrl,
     });
     const db = new SQL.Database(uint8);
 
@@ -1331,7 +859,6 @@ export async function parsePshtSqlite(
                   const innerFile = new File([sliced as any], `${baseName}.ply`, { type: 'application/octet-stream' });
                   const cloud = await parseGaussianFile(innerFile);
                   const poses = generateFittedCameraTrajectory(cloud, 24);
-                  cloud.fileBlob = exportToSplatFormat(cloud);
                   return {
                     cloud,
                     poses,
@@ -1489,7 +1016,6 @@ export async function parsePshtSqlite(
               radius,
             },
           };
-          cloud.fileBlob = exportToSplatFormat(cloud);
         }
       } catch (ptsErr) {
         console.warn('Error reading points table in Postshot SQLite:', ptsErr);
@@ -1524,106 +1050,11 @@ export async function parsePshtSqlite(
       };
     }
 
-    // 4. If cameras are present, build calibrated scene matching true multi-height camera trajectories
-    if (poses.length > 0) {
-      const synthCloud = buildCloudFromCameraTrajectory(poses, baseName);
-      synthCloud.fileBlob = exportToSplatFormat(synthCloud);
-      return {
-        cloud: synthCloud,
-        poses,
-        metadata: {
-          id: `psht_${Date.now()}`,
-          name: baseName,
-          sourceType: 'psht',
-          thumbnailUrl: '',
-          sourceName: originalFile.name,
-          captureDetails: {
-            framesCount: poses.length,
-            resolution: 'Postshot Workspace Cameras',
-            avgReprojectionError: 0.25,
-            captureType: 'orbital',
-            focalLengthMm: 35.0,
-          },
-          totalPoints: synthCloud.count,
-          trainedSteps: 30000,
-        },
-        extractedFormat: 'sparse_reconstruction',
-        message: `Extracted ${poses.length} calibrated camera poses across multiple heights from Postshot project. Scene calibrated and ready to export to .PLY.`,
-      };
-    }
   } catch (err) {
     console.warn('Failed parsing SQLite database with sql.js:', err);
   }
 
-  // Fallback binary scanner for SQLite
-  return parsePshtBinaryScanner(arrayBuffer, baseName, originalFile);
-}
-
-/**
- * Resilient in-memory binary scanner for Postshot files
- */
-function parsePshtBinaryScanner(
-  arrayBuffer: ArrayBuffer,
-  baseName: string,
-  originalFile: File
-): PshtParseResult {
-  const uint8 = new Uint8Array(arrayBuffer);
-  const poses: CameraPose[] = [];
-
-  // Scan text chunks for image names or camera poses
-  const text = new TextDecoder('utf-8', { fatal: false }).decode(uint8.subarray(0, Math.min(uint8.length, 500000)));
-  const matches = text.match(/([a-zA-Z0-9_\-]+\.(?:jpg|jpeg|png|tif|tiff))/gi);
-  const imageNames = matches ? Array.from(new Set(matches)) : [];
-  const numCams = Math.max(24, Math.min(imageNames.length || 24, 180));
-
-  for (let i = 0; i < numCams; i++) {
-    // Multi-tiered trajectory rings (simulating multi-height capture)
-    const tier = i % 3;
-    const tierY = 0.5 + tier * 0.9;
-    const tierRadius = 2.8 - tier * 0.3;
-    const theta = (Math.floor(i / 3) / Math.ceil(numCams / 3)) * Math.PI * 2;
-
-    poses.push({
-      id: `psht_cam_${i}`,
-      index: i + 1,
-      name: imageNames[i] || `Camera_${i + 1}`,
-      position: [
-        Number((Math.sin(theta) * tierRadius).toFixed(2)),
-        Number(tierY.toFixed(2)),
-        Number((Math.cos(theta) * tierRadius).toFixed(2)),
-      ],
-      target: [0, 0, 0],
-      fov: 50,
-      reprojectionError: 0.25,
-      inliersCount: 1500,
-    });
-  }
-
-  const cloud = buildCloudFromCameraTrajectory(poses, baseName);
-  cloud.fileBlob = exportToSplatFormat(cloud);
-
-  return {
-    cloud,
-    poses,
-    metadata: {
-      id: `psht_${Date.now()}`,
-      name: baseName,
-      sourceType: 'psht',
-      thumbnailUrl: '',
-      sourceName: originalFile.name,
-      captureDetails: {
-        framesCount: poses.length,
-        resolution: 'Postshot Reconstructed',
-        avgReprojectionError: 0.25,
-        captureType: 'orbital',
-        focalLengthMm: 35.0,
-      },
-      totalPoints: cloud.count,
-      trainedSteps: 30000,
-    },
-    extractedFormat: 'sparse_reconstruction',
-    message: `Postshot project "${baseName}" loaded (${poses.length} calibrated cameras across multiple heights). Ready to save as .PLY.`,
-  };
+  return null;
 }
 
 /**
@@ -1795,7 +1226,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
         if (poses.length === 0) {
           poses = generateFittedCameraTrajectory(cloud, 24);
         }
-        cloud.fileBlob = exportToSplatFormat(cloud);
         return {
           cloud,
           poses,
@@ -1819,33 +1249,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
           message: `Successfully unpacked ${cloud.count.toLocaleString()} Gaussian splats from Postshot archive.`,
         };
       }
-
-      if (poses.length > 0) {
-        const synthCloud = buildCloudFromCameraTrajectory(poses, baseName);
-        synthCloud.fileBlob = exportToSplatFormat(synthCloud);
-        return {
-          cloud: synthCloud,
-          poses,
-          metadata: {
-            id: `psht_${Date.now()}`,
-            name: baseName,
-            sourceType: 'psht',
-            thumbnailUrl: '',
-            sourceName: file.name,
-            captureDetails: {
-              framesCount: poses.length,
-              resolution: 'Postshot Trajectory',
-              avgReprojectionError: 0.25,
-              captureType: 'orbital',
-              focalLengthMm: 35.0,
-            },
-            totalPoints: synthCloud.count,
-            trainedSteps: 30000,
-          },
-          extractedFormat: 'sparse_reconstruction',
-          message: `Extracted ${poses.length} calibrated camera poses from Postshot project. Scene calibrated and ready to save as .PLY.`,
-        };
-      }
     } catch (zipErr) {
       console.warn('Error reading psht as ZIP archive:', zipErr);
     }
@@ -1859,7 +1262,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
       const innerFile = new File([plyBuffer], `${baseName}.ply`, { type: 'application/octet-stream' });
       const cloud = await parseGaussianFile(innerFile);
       const poses = generateFittedCameraTrajectory(cloud, 24);
-      cloud.fileBlob = exportToSplatFormat(cloud);
 
       return {
         cloud,
@@ -1981,7 +1383,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
         if (poses.length === 0) {
           poses = generateFittedCameraTrajectory(cloud, 24);
         }
-        cloud.fileBlob = exportToSplatFormat(cloud);
 
         return {
           cloud,
@@ -2006,33 +1407,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
           message: `Parsed JSON Postshot scene with ${count.toLocaleString()} points.`,
         };
       }
-
-      if (poses.length > 0) {
-        const synthCloud = buildCloudFromCameraTrajectory(poses, baseName);
-        synthCloud.fileBlob = exportToSplatFormat(synthCloud);
-        return {
-          cloud: synthCloud,
-          poses,
-          metadata: {
-            id: `psht_${Date.now()}`,
-            name: json.project_name || baseName,
-            sourceType: 'psht',
-            thumbnailUrl: '',
-            sourceName: file.name,
-            captureDetails: {
-              framesCount: poses.length,
-              resolution: 'Postshot Project',
-              avgReprojectionError: 0.28,
-              captureType: 'orbital',
-              focalLengthMm: 35.0,
-            },
-            totalPoints: synthCloud.count,
-            trainedSteps: 30000,
-          },
-          extractedFormat: 'sparse_reconstruction',
-          message: `Loaded Postshot project "${baseName}" with ${poses.length} cameras. Ready to save as .PLY.`,
-        };
-      }
     } catch (jsonErr) {
       console.warn('Error reading psht as JSON:', jsonErr);
     }
@@ -2042,7 +1416,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
   try {
     const cloud = await parseGaussianFile(file);
     const poses = generateFittedCameraTrajectory(cloud, 24);
-    cloud.fileBlob = exportToSplatFormat(cloud);
     return {
       cloud,
       poses,
@@ -2066,8 +1439,6 @@ export async function parsePshtFile(file: File): Promise<PshtParseResult> {
       message: `Parsed binary radiance field with ${cloud.count.toLocaleString()} splats.`,
     };
   } catch {
-    // 7. Automatic Recovery using multi-tiered orbital camera reconstruction
-    console.log(`Auto-recovering Postshot project for "${file.name}"...`);
-    return parsePshtBinaryScanner(arrayBuffer, baseName, file);
+    throw new PshtUnsupportedError(file.name, describeContainer(uint8));
   }
 }

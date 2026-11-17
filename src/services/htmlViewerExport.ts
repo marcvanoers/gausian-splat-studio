@@ -28,22 +28,29 @@ export interface StandaloneHtmlOptions {
 /**
  * Converts a Blob to a Base64 string using chunked processing for maximum browser efficiency.
  */
-export async function blobToBase64(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-    binary += String.fromCharCode.apply(null, chunk as any);
+/** Base64-encodes a blob in pieces so large payloads never become one giant JS string. */
+export async function blobToBase64Parts(blob: Blob): Promise<string[]> {
+  const parts: string[] = [];
+  const sliceSize = 3 * (1 << 20);
+  for (let start = 0; start < blob.size; start += sliceSize) {
+    const bytes = new Uint8Array(await blob.slice(start, start + sliceSize).arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000) as unknown as number[]);
+    }
+    parts.push(btoa(binary));
   }
-  return btoa(binary);
+  return parts;
 }
 
+// Above this the embedded base64 text gets too large for browsers to read back as a single string.
+const MAX_EMBEDDED_MODEL_BYTES = 300 * 1024 * 1024;
+const PAYLOAD_PLACEHOLDER = '__SPLAT_BASE64_PAYLOAD__';
+
 /**
- * Generates the complete standalone HTML string.
+ * Generates the complete standalone HTML document.
  */
-export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Promise<string> {
+export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Promise<Blob> {
   const { cloud, project, cropBox, applyCrop, viewSettings, overrideInvertY } = options;
 
   const qualityRatio = options.splatQualityRatio !== undefined
@@ -85,8 +92,13 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
       const fileName = (cloud.fileBlob as File).name?.toLowerCase() || '';
       isPly = !fileName.endsWith('.splat');
     } else {
-      modelBlob = exportGaussianToPly(cloud, activeCrop, true, false, qualityRatio);
+      // The embedded viewer renders SH up to degree 2.
+      modelBlob = exportGaussianToPly(cloud, activeCrop, true, false, qualityRatio, 2);
       isPly = true;
+    }
+    if (modelBlob.size > MAX_EMBEDDED_MODEL_BYTES) {
+      modelBlob = exportToSplatFormat(cloud, activeCrop, false, qualityRatio);
+      isPly = false;
     }
   } else {
     modelBlob = exportToSplatFormat(cloud, activeCrop, false, qualityRatio);
@@ -97,9 +109,9 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
   const splatCount = activeIndices.length;
   const qualityPercent = Math.round(qualityRatio * 100);
 
-  const base64Data = await blobToBase64(modelBlob);
+  const base64Parts = await blobToBase64Parts(modelBlob);
 
-  return `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -462,7 +474,7 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
   </div>
 
   <!-- Embedded 3DGS Binary Splat Data (Base64) -->
-  <script id="splat-data" type="application/octet-stream">${base64Data}</script>
+  <script id="splat-data" type="application/octet-stream">${PAYLOAD_PLACEHOLDER}</script>
 
   <!-- Interactive Viewer Script -->
   <script type="module">
@@ -771,6 +783,9 @@ export async function generateStandaloneHtml(options: StandaloneHtmlOptions): Pr
   </script>
 </body>
 </html>`;
+
+  const [before, after] = html.split(PAYLOAD_PLACEHOLDER);
+  return new Blob([before, ...base64Parts, after], { type: 'text/html;charset=utf-8' });
 }
 
 function escapeHtml(str: string): string {

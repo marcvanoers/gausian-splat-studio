@@ -10,15 +10,18 @@ import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
 import JSZip from 'jszip';
 import initSqlJs from 'sql.js';
 import sqlWasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
+import { isBcfFile, parseBcfSplats } from './pshtBcf';
 
 const SH_C0 = 0.28209479177387814;
+// Sign of each real SH basis function (bands 1-3, f_rest order) under a 180° rotation about X (y,z -> -y,-z).
+const SH_SIGNS_ROT180_X = [-1, -1, 1, -1, 1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1];
 
 export class PshtUnsupportedError extends Error {
   constructor(fileName: string, containerDescription: string) {
     super(
       `"${fileName}" could not be read: no Gaussian splat data was found (${containerDescription}). ` +
-        'The .psht project format is proprietary and undocumented. ' +
-        'In Postshot, export the trained splat as .ply (or run "postshot-cli export -f <file>.psht --export-splat <file>.ply") and import that .ply here.'
+        'It is not a recognized Postshot project (expected a "jawset bcf" file). ' +
+        'In Postshot, export the trained splat as .ply and import that .ply here.'
     );
     this.name = 'PshtUnsupportedError';
   }
@@ -87,10 +90,16 @@ export function exportGaussianToPly(
   cropBox?: CropBox,
   binary: boolean = true,
   invertY: boolean = false,
-  qualityRatio: number = 1.0
+  qualityRatio: number = 1.0,
+  maxShDegree: number = 3
 ): Blob {
   const activeIndices = getActiveIndices(cloud, cropBox, qualityRatio);
   const count = activeIndices.length;
+  const srcRestCount = binary && cloud.harmonics ? Math.floor(cloud.harmonics.length / cloud.count) : 0;
+  const srcBands = srcRestCount / 3;
+  const bands = Math.min(srcBands, (maxShDegree + 1) ** 2 - 1);
+  const restCount = bands * 3;
+  const restProps = Array.from({ length: restCount }, (_, k) => `property float f_rest_${k}`);
 
   const header = [
     'ply',
@@ -105,6 +114,7 @@ export function exportGaussianToPly(
     'property float f_dc_0',
     'property float f_dc_1',
     'property float f_dc_2',
+    ...restProps,
     'property float opacity',
     'property float scale_0',
     'property float scale_1',
@@ -141,9 +151,9 @@ export function exportGaussianToPly(
       const op = Math.max(0.001, Math.min(0.999, cloud.opacities[idx]));
       const logitOp = Math.log(op / (1 - op)).toFixed(4);
 
-      const s0 = Math.log(Math.max(1e-5, cloud.scales[sIdx])).toFixed(4);
-      const s1 = Math.log(Math.max(1e-5, cloud.scales[sIdx + 1])).toFixed(4);
-      const s2 = Math.log(Math.max(1e-5, cloud.scales[sIdx + 2])).toFixed(4);
+      const s0 = Math.log(Math.max(1e-10, cloud.scales[sIdx])).toFixed(4);
+      const s1 = Math.log(Math.max(1e-10, cloud.scales[sIdx + 1])).toFixed(4);
+      const s2 = Math.log(Math.max(1e-10, cloud.scales[sIdx + 2])).toFixed(4);
 
       const r0 = cloud.rotations[rIdx]; // w
       const r1 = cloud.rotations[rIdx + 1]; // x
@@ -161,18 +171,24 @@ export function exportGaussianToPly(
     return new Blob([header + asciiBody], { type: 'text/plain' });
   }
 
-  // Binary PLY: 17 floats per vertex (68 bytes per vertex)
+  // Binary PLY: 17 floats per vertex plus optional f_rest SH coefficients
   const headerBytes = new TextEncoder().encode(header);
-  const vertexBytes = count * 68;
-  const buffer = new ArrayBuffer(headerBytes.length + vertexBytes);
-  const uint8View = new Uint8Array(buffer);
-  uint8View.set(headerBytes, 0);
-
-  const dataView = new DataView(buffer, headerBytes.length);
+  const stride = 68 + restCount * 4;
+  const shSigns = invertY ? SH_SIGNS_ROT180_X : null;
+  // Written in chunks so multi-million-splat clouds with SH don't need one huge ArrayBuffer.
+  const parts: BlobPart[] = [headerBytes];
+  const chunkSize = 1 << 16;
+  let dataView = new DataView(new ArrayBuffer(0));
+  let chunkStart = 0;
 
   for (let i = 0; i < count; i++) {
+    if (i % chunkSize === 0) {
+      chunkStart = i;
+      dataView = new DataView(new ArrayBuffer(Math.min(chunkSize, count - i) * stride));
+      parts.push(dataView.buffer);
+    }
     const idx = activeIndices[i];
-    const offset = i * 68;
+    const offset = (i - chunkStart) * stride;
     const pIdx = idx * 3;
     const sIdx = idx * 3;
     const rIdx = idx * 4;
@@ -193,14 +209,24 @@ export function exportGaussianToPly(
     dataView.setFloat32(offset + 28, (cloud.colors[cIdx + 1] - 0.5) / SH_C0, true);
     dataView.setFloat32(offset + 32, (cloud.colors[cIdx + 2] - 0.5) / SH_C0, true);
 
+    if (restCount > 0) {
+      const hBase = idx * srcRestCount;
+      for (let c = 0; c < 3; c++) {
+        for (let k = 0; k < bands; k++) {
+          const sign = shSigns ? shSigns[k] : 1;
+          dataView.setFloat32(offset + 36 + (c * bands + k) * 4, cloud.harmonics![hBase + c * srcBands + k] * sign, true);
+        }
+      }
+    }
+
     // opacity (logit)
     const op = Math.max(0.001, Math.min(0.999, cloud.opacities[idx]));
-    dataView.setFloat32(offset + 36, Math.log(op / (1 - op)), true);
+    dataView.setFloat32(offset + 36 + restCount * 4, Math.log(op / (1 - op)), true);
 
     // scale_0, 1, 2 (log scale)
-    dataView.setFloat32(offset + 40, Math.log(Math.max(1e-5, cloud.scales[sIdx])), true);
-    dataView.setFloat32(offset + 44, Math.log(Math.max(1e-5, cloud.scales[sIdx + 1])), true);
-    dataView.setFloat32(offset + 48, Math.log(Math.max(1e-5, cloud.scales[sIdx + 2])), true);
+    dataView.setFloat32(offset + 40 + restCount * 4, Math.log(Math.max(1e-10, cloud.scales[sIdx])), true);
+    dataView.setFloat32(offset + 44 + restCount * 4, Math.log(Math.max(1e-10, cloud.scales[sIdx + 1])), true);
+    dataView.setFloat32(offset + 48 + restCount * 4, Math.log(Math.max(1e-10, cloud.scales[sIdx + 2])), true);
 
     // rot_0 (qw), rot_1 (qx), rot_2 (qy), rot_3 (qz)
     const r0 = cloud.rotations[rIdx];
@@ -208,13 +234,13 @@ export function exportGaussianToPly(
     const r2 = cloud.rotations[rIdx + 2];
     const r3 = cloud.rotations[rIdx + 3];
 
-    dataView.setFloat32(offset + 52, invertY ? -r1 : r0, true);
-    dataView.setFloat32(offset + 56, invertY ? r0 : r1, true);
-    dataView.setFloat32(offset + 60, invertY ? -r3 : r2, true);
-    dataView.setFloat32(offset + 64, invertY ? r2 : r3, true);
+    dataView.setFloat32(offset + 52 + restCount * 4, invertY ? -r1 : r0, true);
+    dataView.setFloat32(offset + 56 + restCount * 4, invertY ? r0 : r1, true);
+    dataView.setFloat32(offset + 60 + restCount * 4, invertY ? -r3 : r2, true);
+    dataView.setFloat32(offset + 64 + restCount * 4, invertY ? r2 : r3, true);
   }
 
-  return new Blob([buffer], { type: 'application/octet-stream' });
+  return new Blob(parts, { type: 'application/octet-stream' });
 }
 
 /**
@@ -1068,9 +1094,37 @@ export async function parsePshtSqlite(
  * 6. True multi-height camera trajectory reconstruction when external media references are used.
  */
 export async function parsePshtFile(file: File): Promise<PshtParseResult> {
+  const baseName = file.name.replace(/\.[^/.]+$/, '');
+
+  // Native Postshot project ("jawset bcf"); read lazily since these files are often > 2 GB.
+  if (await isBcfFile(file)) {
+    const cloud = await parseBcfSplats(file);
+    return {
+      cloud,
+      poses: generateFittedCameraTrajectory(cloud, 24),
+      metadata: {
+        id: `psht_${Date.now()}`,
+        name: baseName,
+        sourceType: 'psht',
+        thumbnailUrl: '',
+        sourceName: file.name,
+        captureDetails: {
+          framesCount: 0,
+          resolution: 'Postshot Project',
+          avgReprojectionError: 0,
+          captureType: 'orbital',
+          focalLengthMm: 35.0,
+        },
+        totalPoints: cloud.count,
+        trainedSteps: 0,
+      },
+      extractedFormat: 'project_archive',
+      message: `Loaded ${cloud.count.toLocaleString()} trained Gaussian splats from Postshot project.`,
+    };
+  }
+
   let arrayBuffer = await file.arrayBuffer();
   let uint8 = new Uint8Array(arrayBuffer);
-  const baseName = file.name.replace(/\.[^/.]+$/, '');
 
   // 1. Direct SQLite database detection (Native Postshot project format)
   if (isSqliteDatabase(uint8)) {

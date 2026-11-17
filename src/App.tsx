@@ -165,6 +165,8 @@ export default function App() {
       maxSplatSize: 2.0,
       displayBudget: 2000000,
       shDegree: 1,
+      // Postshot projects are stored Y-down (COLMAP convention).
+      invertY: metadata.sourceType === 'psht' ? true : prev.invertY,
     }));
 
     // Auto-fit 3D crop box to loaded model bounds if present

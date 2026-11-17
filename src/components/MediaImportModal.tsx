@@ -207,10 +207,10 @@ export const MediaImportModal: React.FC<MediaImportModalProps> = ({
       const isPsht = lowerName.endsWith('.psht') || lowerName.endsWith('.phst') || lowerName.endsWith('.db') || lowerName.endsWith('.sqlite') || lowerName.endsWith('.spz');
 
       if (isPsht) {
-        setStatusMessage(`Reading Postshot project database "${file.name}" (SQLite/SfM)...`);
+        setStatusMessage(`Reading Postshot project "${file.name}"...`);
         setProgress(0.3);
         const result = await parsePshtFile(file);
-        setStatusMessage(`Extracted ${result.poses.length} camera poses & ${result.cloud.count.toLocaleString()} 3D points!`);
+        setStatusMessage(result.message);
         setProgress(0.95);
 
         onCustomDatasetLoaded(result.metadata, result.cloud, result.poses);
